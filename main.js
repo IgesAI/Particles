@@ -1,5 +1,6 @@
 ﻿import * as THREE from './js/three/three.module.js';
 import { OrbitControls } from './js/three/examples/jsm/controls/OrbitControls.js';
+import { FirstPersonControls } from './js/three/examples/jsm/controls/FirstPersonControls.js';
 import Stats from './js/three/examples/jsm/libs/stats.module.js';
 
 // Global variables
@@ -12,6 +13,21 @@ let analyser, audioContext, audioSource, dataArray;
 let isAudioActive = false;
 let mouseDown = false; // Add mouseDown tracking variable
 let blackHole, accretionDisk; // Add references to black hole objects
+let fpsControls; // First person controls
+let isSpaceshipMode = false;
+let spaceshipMesh, laserSound, alienSound, gameOverSound;
+let aliens = [];
+let lasers = [];
+let score = 0;
+let scoreDisplay;
+let cockpitContainer, dashboard, steeringWheel;
+let gameOver = false;
+let alienSpeed = 2;
+let tempVector = new THREE.Vector3();
+let tempQuaternion = new THREE.Quaternion();
+let tempDirection = new THREE.Vector3();
+let raycaster = new THREE.Raycaster();
+let lastShotTimestamp; // Add this line to track the last shot time
 
 // Configuration
 const config = {
@@ -34,7 +50,7 @@ const config = {
     },
     
     // Galaxy physics settings
-    mode: 'particle',  // 'particle' or 'galaxy'
+    mode: 'particle',  // 'particle', 'galaxy' or 'spaceship'
     galaxySettings: {
         galaxyRadius: 25,
         spiralArms: 3,
@@ -54,12 +70,30 @@ const config = {
     glow: {
         enabled: true,
         size: 1.5
+    },
+    
+    // Spaceship settings
+    spaceship: {
+        speed: 0.5,
+        turnSpeed: 0.5,
+        laserSpeed: 2.0,
+        laserCooldown: 500, // ms
+        alienCount: 20
     }
 };
 
 // Initialize the scene
 init();
 animate();
+
+// Prevent space key from scrolling the page
+window.addEventListener('keydown', function(e) {
+    // Prevent space key from scrolling
+    if (e.code === 'Space' && isSpaceshipMode) {
+        e.preventDefault();
+        return false;
+    }
+}, {passive: false});
 
 function init() {
     // Create scene
@@ -82,16 +116,16 @@ function init() {
 
     // Create camera
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-camera.position.z = 30;
+    camera.position.z = 30;
 
     // Create renderer with enhanced settings
     renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
-document.body.appendChild(renderer.domElement);
+    document.body.appendChild(renderer.domElement);
 
     // Initialize stats
     stats = new Stats();
@@ -100,9 +134,17 @@ document.body.appendChild(renderer.domElement);
 
     // Add controls
     controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.05;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
     controls.rotateSpeed = 0.5;
+    
+    // Create first person controls (disabled by default)
+    fpsControls = new FirstPersonControls(camera, renderer.domElement);
+    fpsControls.movementSpeed = config.spaceship.speed * 30;
+    fpsControls.lookSpeed = config.spaceship.turnSpeed * 0.1;
+    fpsControls.enabled = false;
+    fpsControls.lookVertical = true;
+    fpsControls.activeLook = true;
 
     // Create particle system based on mode
     if (config.mode === 'galaxy') {
@@ -113,17 +155,33 @@ controls.dampingFactor = 0.05;
     
     // Create background stars
     createStarfield();
-
-    // Event listeners
-    window.addEventListener('resize', onWindowResize);
-    document.addEventListener('mousemove', onDocumentMouseMove);
-    document.addEventListener('mousedown', onDocumentMouseDown);
-    document.addEventListener('mouseup', onDocumentMouseUp);
     
-    // Setup audio
+    // Create spaceship
+    createSpaceship();
+    
+    // Create cockpit for first-person view
+    createCockpit();
+    
+    // Create score display
+    createScoreDisplay();
+    
+    // Load sounds
+    loadLaserSound();
+    loadAlienSound();
+    loadGameOverSound();
+    
+    // Setup audio analyzer
     setupAudio();
     
-    // Add UI controls
+    // Add event listeners
+    window.addEventListener('resize', onWindowResize, false);
+    document.addEventListener('mousemove', onDocumentMouseMove, false);
+    document.addEventListener('mousedown', onDocumentMouseDown, false);
+    document.addEventListener('mouseup', onDocumentMouseUp, false);
+    document.addEventListener('keydown', onKeyDown, false);
+    document.addEventListener('keyup', onKeyUp, false);
+    
+    // Create UI controls
     createControls();
 }
 
@@ -559,7 +617,60 @@ function clamp(value, min, max) {
 
 function animate() {
     requestAnimationFrame(animate);
-    controls.update();
+    
+    const delta = 0.016; // Approx time between frames
+    
+    if (isSpaceshipMode) {
+        // Only update fps controls for movement when not using dual mouse controls
+        if (!(leftMouseDown && rightMouseDown)) {
+            fpsControls.update(delta);
+        } else {
+            // Apply forward/backward movement based on keys when dual mouse is active
+            const moveSpeed = config.spaceship.speed * 30 * delta;
+            
+            // Get forward vector from camera direction
+            const forward = new THREE.Vector3(0, 0, -1);
+            forward.applyQuaternion(camera.quaternion);
+            
+            // Check for WASD or arrow keys
+            if (keyStates['KeyW'] || keyStates['ArrowUp']) {
+                camera.position.addScaledVector(forward, moveSpeed);
+            }
+            if (keyStates['KeyS'] || keyStates['ArrowDown']) {
+                camera.position.addScaledVector(forward, -moveSpeed);
+            }
+            
+            // Apply sideways movement
+            const right = new THREE.Vector3(1, 0, 0);
+            right.applyQuaternion(camera.quaternion);
+            
+            if (keyStates['KeyA'] || keyStates['ArrowLeft']) {
+                camera.position.addScaledVector(right, -moveSpeed);
+            }
+            if (keyStates['KeyD'] || keyStates['ArrowRight']) {
+                camera.position.addScaledVector(right, moveSpeed);
+            }
+        }
+        
+        updateLasersAndAliens(delta);
+        
+        // Update cockpit position to match camera
+        if (cockpitContainer) {
+            cockpitContainer.position.copy(camera.position);
+            cockpitContainer.quaternion.copy(camera.quaternion);
+            
+            // Make steering wheel rotate slightly based on turning
+            if (steeringWheel) {
+                // Extract yaw rotation from camera quaternion
+                const yawRot = Math.atan2(2.0 * (camera.quaternion.y * camera.quaternion.w),
+                                        1.0 - 2.0 * (camera.quaternion.y * camera.quaternion.y));
+                // Apply a scaled rotation to the steering wheel
+                steeringWheel.rotation.z = yawRot * 2;
+            }
+        }
+    } else {
+        controls.update();
+    }
     
     // Choose update method based on mode
     if (config.mode === 'galaxy') {
@@ -1052,6 +1163,52 @@ function createControls() {
     
     resetDiv.appendChild(resetBtn);
     container.appendChild(resetDiv);
+    
+    // Add spaceship mode button
+    const spaceshipButtonContainer = document.createElement('div');
+    spaceshipButtonContainer.style.textAlign = 'center';
+    spaceshipButtonContainer.style.margin = '15px 0';
+    
+    const spaceshipButton = document.createElement('button');
+    spaceshipButton.textContent = isSpaceshipMode ? 'Exit Spaceship' : 'Enter Spaceship';
+    spaceshipButton.style.backgroundColor = '#4CAF50';
+    spaceshipButton.style.color = 'white';
+    spaceshipButton.style.padding = '10px 15px';
+    spaceshipButton.style.border = 'none';
+    spaceshipButton.style.borderRadius = '5px';
+    spaceshipButton.style.cursor = 'pointer';
+    spaceshipButton.style.fontWeight = 'bold';
+    spaceshipButton.style.fontSize = '16px';
+    spaceshipButton.style.width = '100%';
+    
+    spaceshipButton.addEventListener('click', function() {
+        toggleSpaceshipMode();
+        this.textContent = isSpaceshipMode ? 'Exit Spaceship' : 'Enter Spaceship';
+    });
+    
+    spaceshipButtonContainer.appendChild(spaceshipButton);
+    container.appendChild(spaceshipButtonContainer);
+    
+    // Spaceship controls instructions
+    if (isSpaceshipMode) {
+        const instructionsDiv = document.createElement('div');
+        instructionsDiv.style.marginTop = '10px';
+        instructionsDiv.style.padding = '10px';
+        instructionsDiv.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+        instructionsDiv.style.borderRadius = '5px';
+        instructionsDiv.style.fontSize = '12px';
+        
+        instructionsDiv.innerHTML = `
+            <p><strong>Spaceship Controls:</strong></p>
+            <p>W/S or Arrow Keys - Forward/Backward</p>
+            <p>A/D or Arrow Keys - Strafe Left/Right</p>
+            <p>Mouse - Look around</p>
+            <p><strong>HOLD BOTH MOUSE BUTTONS</strong> - Control ship orientation</p>
+            <p>Space - Fire laser</p>
+        `;
+        
+        container.appendChild(instructionsDiv);
+    }
     
     // Add container to panel
     controlsPanel.appendChild(container);
@@ -1598,3 +1755,1462 @@ function createBlackHole() {
     accretionDisk.rotation.x = Math.PI / 2; // Horizontal
     scene.add(accretionDisk);
 }
+
+function createSpaceship() {
+    // Simple spaceship mesh
+    const geometry = new THREE.ConeGeometry(0.5, 2, 8);
+    geometry.rotateX(Math.PI / 2);
+    const material = new THREE.MeshPhongMaterial({
+        color: 0x22aadd,
+        emissive: 0x112244,
+        shininess: 30,
+        specular: 0x2233aa
+    });
+    
+    spaceshipMesh = new THREE.Mesh(geometry, material);
+    spaceshipMesh.visible = false; // Hide until spaceship mode is activated
+    scene.add(spaceshipMesh);
+    
+    // Create cockpit elements
+    createCockpit();
+}
+
+function createCockpit() {
+    // Create cockpit container
+    cockpitContainer = new THREE.Object3D();
+    // Scale down the entire cockpit to be visually smaller
+    cockpitContainer.scale.set(0.6, 0.6, 0.6);
+    scene.add(cockpitContainer);
+    
+    // Add ambient cockpit lighting
+    const cockpitAmbientLight = new THREE.AmbientLight(0x555566, 0.5);
+    cockpitContainer.add(cockpitAmbientLight);
+    
+    // Add dashboard point light
+    const dashboardLight = new THREE.PointLight(0x6688cc, 1.5, 3);
+    dashboardLight.position.set(0, 0.3, -0.5);
+    cockpitContainer.add(dashboardLight);
+    
+    // Add overhead instrument light (warm color)
+    const overheadLight = new THREE.PointLight(0xffaa44, 1, 2);
+    overheadLight.position.set(0, 1, -1);
+    cockpitContainer.add(overheadLight);
+    
+    // Add side panel lights
+    const leftPanelLight = new THREE.PointLight(0x88aaff, 0.8, 1.5);
+    leftPanelLight.position.set(-1.2, -0.3, -0.7);
+    cockpitContainer.add(leftPanelLight);
+    
+    const rightPanelLight = new THREE.PointLight(0x88aaff, 0.8, 1.5);
+    rightPanelLight.position.set(1.2, -0.3, -0.7);
+    cockpitContainer.add(rightPanelLight);
+    
+    // Add subtle floor lighting
+    const floorLight = new THREE.PointLight(0x4466aa, 0.6, 2);
+    floorLight.position.set(0, -0.8, -0.2);
+    cockpitContainer.add(floorLight);
+    
+    // Create aircraft-style instrument panel - wider and flatter
+    const dashboardGeometry = new THREE.BoxGeometry(3.4, 0.65, 0.8);
+    dashboardGeometry.translate(0, 0, 0.1);
+    const dashboardMaterial = new THREE.MeshPhongMaterial({ 
+        color: 0x222233,
+        shininess: 60,
+        specular: 0x555566
+    });
+    dashboard = new THREE.Mesh(dashboardGeometry, dashboardMaterial);
+    dashboard.position.set(0, -0.85, -1.2);
+    cockpitContainer.add(dashboard);
+    
+    // Add dashboard trim and details
+    const trimGeometry = new THREE.BoxGeometry(3.5, 0.03, 0.85);
+    const trimMaterial = new THREE.MeshPhongMaterial({
+        color: 0x777788,
+        shininess: 90,
+        specular: 0xaaaaaa
+    });
+    const dashboardTrim = new THREE.Mesh(trimGeometry, trimMaterial);
+    dashboardTrim.position.set(0, -0.55, -1.2);
+    cockpitContainer.add(dashboardTrim);
+    
+    // Add overhead panel
+    const overheadPanelGeometry = new THREE.BoxGeometry(1.2, 0.2, 0.4);
+    const overheadPanel = new THREE.Mesh(overheadPanelGeometry, dashboardMaterial);
+    overheadPanel.position.set(0, 1.2, -1.1);
+    cockpitContainer.add(overheadPanel);
+    
+    // Overhead switches and buttons
+    const overheadButtonsCount = 8;
+    const overheadButtonColors = [0xff0000, 0xffff00, 0x00ff00, 0x00ffff];
+    
+    for (let i = 0; i < overheadButtonsCount; i++) {
+        const switchGeometry = new THREE.BoxGeometry(0.08, 0.06, 0.06);
+        const switchMaterial = new THREE.MeshPhongMaterial({
+            color: overheadButtonColors[i % overheadButtonColors.length],
+            shininess: 70,
+            emissive: new THREE.Color(overheadButtonColors[i % overheadButtonColors.length]).multiplyScalar(0.2)
+        });
+        const switchMesh = new THREE.Mesh(switchGeometry, switchMaterial);
+        switchMesh.position.set(-0.5 + i * 0.15, 1.15, -0.95);
+        overheadPanel.add(switchMesh);
+    }
+    
+    // Create realistic aircraft instrument arrangement
+    // Center console with primary flight display
+    const primaryDisplayGeometry = new THREE.PlaneGeometry(0.8, 0.6);
+    const primaryDisplayMaterial = new THREE.MeshPhongMaterial({
+        color: 0x000000,
+        emissive: 0x001133,
+        shininess: 100
+    });
+    const primaryDisplay = new THREE.Mesh(primaryDisplayGeometry, primaryDisplayMaterial);
+    primaryDisplay.position.set(0, -0.6, -0.85);
+    primaryDisplay.rotation.x = -Math.PI * 0.25;
+    cockpitContainer.add(primaryDisplay);
+    
+    // Add artificial horizon lines to primary display
+    const horizonLineGeometry = new THREE.PlaneGeometry(0.7, 0.01);
+    const horizonLineMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00ffff,
+        transparent: true,
+        opacity: 0.8
+    });
+    const horizonLine = new THREE.Mesh(horizonLineGeometry, horizonLineMaterial);
+    horizonLine.position.z = 0.01;
+    primaryDisplay.add(horizonLine);
+    
+    // Add attitude indicator
+    const attitudeLineGeometry = new THREE.PlaneGeometry(0.2, 0.01);
+    const attitudeLineMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffff00,
+        transparent: true,
+        opacity: 0.8
+    });
+    const attitudeLine1 = new THREE.Mesh(attitudeLineGeometry, attitudeLineMaterial);
+    attitudeLine1.position.set(-0.15, 0, 0.01);
+    primaryDisplay.add(attitudeLine1);
+    
+    const attitudeLine2 = new THREE.Mesh(attitudeLineGeometry, attitudeLineMaterial);
+    attitudeLine2.position.set(0.15, 0, 0.01);
+    primaryDisplay.add(attitudeLine2);
+    
+    // Secondary displays - left side (navigation)
+    const navDisplayGeometry = new THREE.PlaneGeometry(0.5, 0.4);
+    const navDisplayMaterial = new THREE.MeshPhongMaterial({
+        color: 0x000000,
+        emissive: 0x001122,
+        shininess: 80
+    });
+    const navDisplay = new THREE.Mesh(navDisplayGeometry, navDisplayMaterial);
+    navDisplay.position.set(-1.0, -0.6, -0.85);
+    navDisplay.rotation.x = -Math.PI * 0.25;
+    cockpitContainer.add(navDisplay);
+    
+    // Add circular radar sweep to nav display
+    const radarCircleGeometry = new THREE.RingGeometry(0.05, 0.18, 32);
+    const radarCircleMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00ff00,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide
+    });
+    const radarCircle = new THREE.Mesh(radarCircleGeometry, radarCircleMaterial);
+    radarCircle.position.z = 0.01;
+    navDisplay.add(radarCircle);
+    
+    // Radar sweep line
+    const radarSweepGeometry = new THREE.PlaneGeometry(0.18, 0.01);
+    const radarSweepMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00ff00,
+        transparent: true,
+        opacity: 0.7
+    });
+    const radarSweep = new THREE.Mesh(radarSweepGeometry, radarSweepMaterial);
+    radarSweep.position.set(0.09, 0, 0.02);
+    radarSweep.geometry.translate(0.09, 0, 0);
+    radarCircle.add(radarSweep);
+    
+    // Secondary displays - right side (engine status)
+    const engineDisplayGeometry = new THREE.PlaneGeometry(0.5, 0.4);
+    const engineDisplayMaterial = new THREE.MeshPhongMaterial({
+        color: 0x000000,
+        emissive: 0x110011,
+        shininess: 80
+    });
+    const engineDisplay = new THREE.Mesh(engineDisplayGeometry, engineDisplayMaterial);
+    engineDisplay.position.set(1.0, -0.6, -0.85);
+    engineDisplay.rotation.x = -Math.PI * 0.25;
+    cockpitContainer.add(engineDisplay);
+    
+    // Add engine gauges
+    const gaugePositions = [
+        { x: -0.15, y: 0.1 },
+        { x: 0.15, y: 0.1 },
+        { x: -0.15, y: -0.1 },
+        { x: 0.15, y: -0.1 }
+    ];
+    
+    const gaugeColors = [0xff0000, 0x00ff00, 0xffff00, 0x00ffff];
+    
+    gaugePositions.forEach((pos, i) => {
+        const gaugeGeometry = new THREE.RingGeometry(0.05, 0.07, 16);
+        const gaugeMaterial = new THREE.MeshBasicMaterial({
+            color: gaugeColors[i],
+            transparent: true,
+            opacity: 0.7,
+            side: THREE.DoubleSide
+        });
+        const gauge = new THREE.Mesh(gaugeGeometry, gaugeMaterial);
+        gauge.position.set(pos.x, pos.y, 0.01);
+        engineDisplay.add(gauge);
+        
+        // Gauge needle
+        const needleGeometry = new THREE.PlaneGeometry(0.06, 0.01);
+        const needleMaterial = new THREE.MeshBasicMaterial({
+            color: 0xffffff,
+            transparent: false
+        });
+        const needle = new THREE.Mesh(needleGeometry, needleMaterial);
+        needle.position.set(0, 0, 0.01);
+        needle.geometry.translate(0.03, 0, 0);
+        needle.rotation.z = Math.PI * 0.25 * Math.random();
+        gauge.add(needle);
+    });
+    
+    // Physical control yoke (more realistic aircraft yoke)
+    steeringWheel = new THREE.Object3D();
+    
+    // Yoke base/shaft
+    const yokeBaseGeometry = new THREE.CylinderGeometry(0.04, 0.04, 0.5, 16);
+    const yokeMaterial = new THREE.MeshPhongMaterial({
+        color: 0x333333,
+        shininess: 70,
+        specular: 0x777777
+    });
+    const yokeBase = new THREE.Mesh(yokeBaseGeometry, yokeMaterial);
+    yokeBase.rotation.x = Math.PI / 2;
+    yokeBase.position.y = 0.1;
+    steeringWheel.add(yokeBase);
+    
+    // Yoke wheel (circular control wheel)
+    const yokeWheelGeometry = new THREE.TorusGeometry(0.15, 0.025, 16, 32, Math.PI * 1.5);
+    const yokeWheelMaterial = new THREE.MeshPhongMaterial({
+        color: 0x222222,
+        shininess: 60,
+        specular: 0x555555
+    });
+    const yokeWheel = new THREE.Mesh(yokeWheelGeometry, yokeWheelMaterial);
+    yokeWheel.position.set(0, 0.45, 0);
+    yokeWheel.rotation.x = Math.PI / 2;
+    steeringWheel.add(yokeWheel);
+    
+    // Add wheel center
+    const wheelCenterGeometry = new THREE.CylinderGeometry(0.04, 0.04, 0.05, 16);
+    const wheelCenter = new THREE.Mesh(wheelCenterGeometry, yokeMaterial);
+    wheelCenter.position.set(0, 0.45, 0);
+    wheelCenter.rotation.x = Math.PI / 2;
+    steeringWheel.add(wheelCenter);
+    
+    // Add grips to the wheel
+    const leftGripGeometry = new THREE.CylinderGeometry(0.028, 0.028, 0.08, 16);
+    const gripMaterial = new THREE.MeshPhongMaterial({
+        color: 0x111111,
+        shininess: 50
+    });
+    
+    const leftGrip = new THREE.Mesh(leftGripGeometry, gripMaterial);
+    leftGrip.position.set(-0.15, 0.45, 0);
+    leftGrip.rotation.z = Math.PI / 2;
+    steeringWheel.add(leftGrip);
+    
+    const rightGrip = new THREE.Mesh(leftGripGeometry, gripMaterial);
+    rightGrip.position.set(0.15, 0.45, 0);
+    rightGrip.rotation.z = Math.PI / 2;
+    steeringWheel.add(rightGrip);
+    
+    // Add red fire button on right grip
+    const fireButtonGeometry = new THREE.CylinderGeometry(0.015, 0.015, 0.01, 16);
+    const fireButtonMaterial = new THREE.MeshPhongMaterial({
+        color: 0xff0000,
+        emissive: 0x330000,
+        shininess: 80
+    });
+    const fireButton = new THREE.Mesh(fireButtonGeometry, fireButtonMaterial);
+    fireButton.position.set(0.15, 0.45, 0.04);
+    fireButton.rotation.x = Math.PI / 2;
+    steeringWheel.add(fireButton);
+    
+    // Position the yoke
+    steeringWheel.position.set(0, -0.8, -0.6);
+    cockpitContainer.add(steeringWheel);
+    
+    // Create side panels with controls
+    const leftPanelGeometry = new THREE.BoxGeometry(0.4, 0.7, 1.4);
+    const panelMaterial = new THREE.MeshPhongMaterial({
+        color: 0x222233,
+        shininess: 40
+    });
+    const leftPanel = new THREE.Mesh(leftPanelGeometry, panelMaterial);
+    leftPanel.position.set(-1.5, -0.6, -0.5);
+    cockpitContainer.add(leftPanel);
+    
+    const rightPanelGeometry = new THREE.BoxGeometry(0.4, 0.7, 1.4);
+    const rightPanel = new THREE.Mesh(rightPanelGeometry, panelMaterial);
+    rightPanel.position.set(1.5, -0.6, -0.5);
+    cockpitContainer.add(rightPanel);
+    
+    // Add throttle controls to left panel
+    const throttleBaseGeometry = new THREE.BoxGeometry(0.25, 0.08, 0.2);
+    const throttleBaseMaterial = new THREE.MeshPhongMaterial({
+        color: 0x333344,
+        shininess: 50
+    });
+    const throttleBase = new THREE.Mesh(throttleBaseGeometry, throttleBaseMaterial);
+    throttleBase.position.set(-1.3, -0.5, -0.7);
+    throttleBase.name = "throttleBase";
+    cockpitContainer.add(throttleBase);
+    
+    // Create throttle levers (dual engine)
+    for (let i = 0; i < 2; i++) {
+        const throttleLeverGeometry = new THREE.BoxGeometry(0.05, 0.25, 0.04);
+        const throttleLeverMaterial = new THREE.MeshPhongMaterial({
+            color: 0xcc0000,
+            shininess: 60
+        });
+        const throttleLever = new THREE.Mesh(throttleLeverGeometry, throttleLeverMaterial);
+        throttleLever.position.set(-0.06 + i * 0.12, 0.17, 0);
+        throttleLever.rotation.x = -Math.PI / 6;
+        throttleLever.name = i === 0 ? "throttleLever" : "throttleLever2";
+        throttleBase.add(throttleLever);
+        
+        // Add throttle knobs
+        const throttleKnobGeometry = new THREE.CylinderGeometry(0.02, 0.02, 0.06, 16);
+        const throttleKnobMaterial = new THREE.MeshPhongMaterial({
+            color: 0x111111,
+            shininess: 80
+        });
+        const throttleKnob = new THREE.Mesh(throttleKnobGeometry, throttleKnobMaterial);
+        throttleKnob.position.set(0, 0.15, 0);
+        throttleKnob.rotation.x = Math.PI / 2;
+        throttleKnob.name = i === 0 ? "throttleKnob" : "throttleKnob2";
+        throttleLever.add(throttleKnob);
+    }
+    
+    // Radio panel on right side
+    const radioPanelGeometry = new THREE.BoxGeometry(0.25, 0.15, 0.25);
+    const radioPanelMaterial = new THREE.MeshPhongMaterial({
+        color: 0x111122,
+        shininess: 50
+    });
+    const radioPanel = new THREE.Mesh(radioPanelGeometry, radioPanelMaterial);
+    radioPanel.position.set(1.3, -0.3, -0.7);
+    cockpitContainer.add(radioPanel);
+    
+    // Radio display
+    const radioDisplayGeometry = new THREE.PlaneGeometry(0.2, 0.06);
+    const radioDisplayMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00ff00,
+        transparent: true,
+        opacity: 0.8
+    });
+    const radioDisplay = new THREE.Mesh(radioDisplayGeometry, radioDisplayMaterial);
+    radioDisplay.position.set(0, 0.04, 0.13);
+    radioPanel.add(radioDisplay);
+    
+    // Radio knobs
+    for (let i = 0; i < 2; i++) {
+        const knobGeometry = new THREE.CylinderGeometry(0.02, 0.02, 0.02, 16);
+        const knobMaterial = new THREE.MeshPhongMaterial({
+            color: 0x777777,
+            shininess: 80
+        });
+        const knob = new THREE.Mesh(knobGeometry, knobMaterial);
+        knob.position.set(-0.07 + i * 0.14, -0.04, 0.13);
+        knob.rotation.x = Math.PI / 2;
+        radioPanel.add(knob);
+    }
+    
+    // Add airplane-style rudder pedals
+    const pedalGeometry = new THREE.BoxGeometry(0.15, 0.05, 0.1);
+    const pedalMaterial = new THREE.MeshPhongMaterial({
+        color: 0x444444,
+        shininess: 60
+    });
+    
+    const leftPedal = new THREE.Mesh(pedalGeometry, pedalMaterial);
+    leftPedal.position.set(-0.15, -1.18, -0.6);
+    leftPedal.rotation.x = Math.PI / 6;
+    cockpitContainer.add(leftPedal);
+    
+    const rightPedal = new THREE.Mesh(pedalGeometry, pedalMaterial);
+    rightPedal.position.set(0.15, -1.18, -0.6);
+    rightPedal.rotation.x = Math.PI / 6;
+    cockpitContainer.add(rightPedal);
+    
+    // Create advanced windshield - with frame structure
+    // Main windshield glass
+    const windshieldGeometry = new THREE.SphereGeometry(2.2, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2.5);
+    const windshieldMaterial = new THREE.MeshPhongMaterial({
+        color: 0x8899ff,
+        transparent: true,
+        opacity: 0.1,
+        shininess: 100,
+        specular: 0xffffff,
+        side: THREE.DoubleSide
+    });
+    
+    const windshield = new THREE.Mesh(windshieldGeometry, windshieldMaterial);
+    windshield.position.set(0, 0, -1);
+    windshield.rotation.y = Math.PI;
+    cockpitContainer.add(windshield);
+    
+    // Add windshield frame
+    const frameRadius = 2.2;
+    const frameWidth = 0.04;
+    const frameMaterial = new THREE.MeshPhongMaterial({
+        color: 0x444455,
+        shininess: 60
+    });
+    
+    // Central vertical frame
+    const verticalFrameGeometry = new THREE.BoxGeometry(frameWidth, 0.9, frameWidth);
+    const verticalFrame = new THREE.Mesh(verticalFrameGeometry, frameMaterial);
+    verticalFrame.position.set(0, 0.7, -2.15);
+    cockpitContainer.add(verticalFrame);
+    
+    // Horizontal frames
+    const horizontalFrameGeometry = new THREE.BoxGeometry(2.0, frameWidth, frameWidth);
+    const horizontalFrame = new THREE.Mesh(horizontalFrameGeometry, frameMaterial);
+    horizontalFrame.position.set(0, 0.4, -2.15);
+    cockpitContainer.add(horizontalFrame);
+    
+    // Angled frames
+    const createAngledFrame = (xPos, yPos) => {
+        const length = 0.8;
+        const angleFrameGeometry = new THREE.BoxGeometry(length, frameWidth, frameWidth);
+        const angleFrame = new THREE.Mesh(angleFrameGeometry, frameMaterial);
+        angleFrame.position.set(xPos, yPos, -2.15);
+        angleFrame.rotation.z = xPos > 0 ? Math.PI / 4 : -Math.PI / 4;
+        cockpitContainer.add(angleFrame);
+    };
+    
+    createAngledFrame(-0.7, 0.7);
+    createAngledFrame(0.7, 0.7);
+    
+    // Add targeting reticle in the center of view
+    const reticleSize = 0.025;
+    const reticleGeometry = new THREE.RingGeometry(reticleSize, reticleSize + 0.008, 32);
+    const reticleMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff3333,
+        transparent: true,
+        opacity: 0.7,
+        side: THREE.DoubleSide
+    });
+    const reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
+    reticle.position.set(0, 0, -2);
+    cockpitContainer.add(reticle);
+    
+    // Add crosshair lines
+    const lineGeometryH = new THREE.PlaneGeometry(reticleSize * 6, 0.002);
+    const lineGeometryV = new THREE.PlaneGeometry(0.002, reticleSize * 6);
+    const lineMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff3333,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide
+    });
+    
+    const lineH = new THREE.Mesh(lineGeometryH, lineMaterial);
+    lineH.position.set(0, 0, -2);
+    cockpitContainer.add(lineH);
+    
+    const lineV = new THREE.Mesh(lineGeometryV, lineMaterial);
+    lineV.position.set(0, 0, -2);
+    cockpitContainer.add(lineV);
+    
+    // Add small tick marks around reticle
+    for (let i = 0; i < 8; i++) {
+        const angle = (i * Math.PI) / 4;
+        const distance = 0.06;
+        
+        const tickWidth = i % 2 === 0 ? 0.025 : 0.015;
+        const tickGeometry = new THREE.PlaneGeometry(0.002, tickWidth);
+        const tick = new THREE.Mesh(tickGeometry, lineMaterial);
+        
+        const x = Math.sin(angle) * distance;
+        const y = Math.cos(angle) * distance;
+        
+        tick.position.set(x, y, -2);
+        tick.rotation.z = angle;
+        cockpitContainer.add(tick);
+    }
+    
+    // Add cockpit floor
+    const floorGeometry = new THREE.BoxGeometry(3.2, 0.05, 2);
+    const floorMaterial = new THREE.MeshPhongMaterial({
+        color: 0x222233,
+        shininess: 30
+    });
+    const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+    floor.position.set(0, -1.25, -0.2);
+    cockpitContainer.add(floor);
+    
+    // Make cockpit initially invisible
+    cockpitContainer.visible = false;
+}
+
+function createAliens() {
+    // Clean up any existing aliens
+    for (let alien of aliens) {
+        scene.remove(alien);
+        alien.geometry.dispose();
+        alien.material.dispose();
+    }
+    aliens = [];
+    
+    // Create new aliens
+    const alienCount = config.spaceship.alienCount;
+    
+    for (let i = 0; i < alienCount; i++) {
+        // Create a simple alien shape
+        const geometry = new THREE.SphereGeometry(0.5, 8, 8);
+        const material = new THREE.MeshPhongMaterial({
+            color: 0xff4400,
+            emissive: 0x441100,
+            shininess: 30
+        });
+        
+        const alien = new THREE.Mesh(geometry, material);
+        
+        // Random position within a radius
+        const radius = 30 + Math.random() * 70; // 30-100 units away
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        
+        alien.position.x = radius * Math.sin(phi) * Math.cos(theta);
+        alien.position.y = radius * Math.sin(phi) * Math.sin(theta);
+        alien.position.z = radius * Math.cos(phi);
+        
+        // Add to scene and array
+        scene.add(alien);
+        aliens.push(alien);
+    }
+}
+
+function createScoreDisplay() {
+    // Create score display div
+    scoreDisplay = document.createElement('div');
+    scoreDisplay.style.position = 'absolute';
+    scoreDisplay.style.top = '10px';
+    scoreDisplay.style.left = '10px';
+    scoreDisplay.style.color = '#ffffff';
+    scoreDisplay.style.fontSize = '24px';
+    scoreDisplay.style.fontFamily = 'Arial, sans-serif';
+    scoreDisplay.style.textShadow = '2px 2px 4px rgba(0, 0, 0, 0.7)';
+    scoreDisplay.style.display = 'none';
+    scoreDisplay.textContent = 'Score: 0';
+    document.body.appendChild(scoreDisplay);
+}
+
+function updateScoreDisplay() {
+    if (scoreDisplay) {
+        scoreDisplay.textContent = `Score: ${score}`;
+    }
+}
+
+function loadLaserSound() {
+    // Create audio element for laser sound
+    laserSound = new Audio();
+    laserSound.src = 'data:audio/wav;base64,UklGRqRnAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YYBnAACBgIF/gn2Cf4GBgYSDhoOIhYmGiYmJi4uNjIyOjI+JkIuRjZKPk5GUk5WS'; // Base64 placeholder
+    laserSound.volume = 0.4;
+    laserSound.preload = 'auto';
+}
+
+function loadAlienSound() {
+    // Create audio element for alien hit sound
+    alienSound = new Audio();
+    alienSound.src = 'data:audio/wav;base64,UklGRqRnAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YYBnAACBgIF/gn2Cf4GBgYSDhoOIhYmGiYmJi4uNjIyOjI+JkIuRjZKPk5GUk5WS'; // Base64 placeholder
+    alienSound.volume = 0.5;
+    alienSound.preload = 'auto';
+}
+
+function loadGameOverSound() {
+    // Create audio element for game over sound
+    gameOverSound = new Audio();
+    gameOverSound.src = 'data:audio/wav;base64,UklGRqRnAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YYBnAACBgIF/gn2Cf4GBgYSDhoOIhYmGiYmJi4uNjIyOjI+JkIuRjZKPk5GUk5WS'; // Base64 placeholder
+    gameOverSound.volume = 0.6;
+    gameOverSound.preload = 'auto';
+}
+
+function shootLaser() {
+    // Create laser beam with initial length
+    const laserLength = 5; // Initial length
+    const laserGeometry = new THREE.CylinderGeometry(0.05, 0.05, laserLength, 12);
+    laserGeometry.rotateX(Math.PI / 2); // Make cylinder point forward
+    const laserMaterial = new THREE.MeshPhongMaterial({
+        color: 0xff2200,
+        emissive: 0xff2200,
+        emissiveIntensity: 1.5,
+        transparent: true,
+        opacity: 0.9
+    });
+    const laser = new THREE.Mesh(laserGeometry, laserMaterial);
+    
+    // Add glow effect to laser
+    const laserGlowGeometry = new THREE.CylinderGeometry(0.12, 0.12, laserLength, 12);
+    laserGlowGeometry.rotateX(Math.PI / 2);
+    const laserGlowMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff4400,
+        transparent: true,
+        opacity: 0.5,
+        blending: THREE.AdditiveBlending
+    });
+    const laserGlow = new THREE.Mesh(laserGlowGeometry, laserGlowMaterial);
+    laser.add(laserGlow);
+    
+    // Add second outer glow for more visibility
+    const outerGlowGeometry = new THREE.CylinderGeometry(0.2, 0.2, laserLength, 12);
+    outerGlowGeometry.rotateX(Math.PI / 2);
+    const outerGlowMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff8800,
+        transparent: true,
+        opacity: 0.3,
+        blending: THREE.AdditiveBlending
+    });
+    const outerGlow = new THREE.Mesh(outerGlowGeometry, outerGlowMaterial);
+    laser.add(outerGlow);
+    
+    // Get camera position and direction
+    camera.getWorldPosition(tempVector);
+    camera.getWorldQuaternion(tempQuaternion);
+    
+    // Set laser direction
+    tempDirection.set(0, 0, -1).applyQuaternion(tempQuaternion);
+    
+    // Position laser in front of the camera - offset from cockpit view
+    const laserStartPos = tempVector.clone().addScaledVector(tempDirection, 2);
+    
+    laser.position.copy(laserStartPos);
+    laser.quaternion.copy(tempQuaternion);
+    
+    // Create muzzle flash effect
+    const flashGeometry = new THREE.SphereGeometry(0.3, 16, 16);
+    const flashMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff7700,
+        transparent: true,
+        opacity: 0.9,
+        blending: THREE.AdditiveBlending
+    });
+    const flash = new THREE.Mesh(flashGeometry, flashMaterial);
+    flash.scale.set(1, 1, 0.5);
+    flash.position.copy(laserStartPos);
+    scene.add(flash);
+    
+    // Add a glowing ring for additional muzzle effect
+    const ringGeometry = new THREE.RingGeometry(0.1, 0.35, 32);
+    const ringMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff5500,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide
+    });
+    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+    ring.position.copy(laserStartPos);
+    ring.lookAt(laserStartPos.clone().add(tempDirection));
+    scene.add(ring);
+    
+    // Add trail particles for the laser
+    const trailParticles = [];
+    for (let i = 0; i < 5; i++) {
+        const particleGeometry = new THREE.SphereGeometry(0.06, 8, 8);
+        const particleMaterial = new THREE.MeshBasicMaterial({
+            color: 0xff6600,
+            transparent: true,
+            opacity: 0.7,
+            blending: THREE.AdditiveBlending
+        });
+        const particle = new THREE.Mesh(particleGeometry, particleMaterial);
+        
+        // Position behind the laser at different offsets
+        const offset = 0.2 + i * 0.1;
+        particle.position.copy(laserStartPos.clone().addScaledVector(tempDirection, -offset));
+        scene.add(particle);
+        trailParticles.push(particle);
+    }
+    
+    // Store data with the laser
+    laser.userData = {
+        startPosition: laserStartPos.clone(),
+        direction: tempDirection.clone(),
+        distanceTraveled: 0,
+        creationTime: Date.now(),
+        flash: flash,
+        ring: ring,
+        trailParticles: trailParticles,
+        maxDistance: 500
+    };
+    
+    scene.add(laser);
+    lasers.push(laser);
+    
+    // Play laser sound
+    if (laserSound) {
+        laserSound.currentTime = 0;
+        laserSound.play().catch(e => console.log("Couldn't play laser sound:", e));
+    }
+    
+    // Remove flash effects after short time
+    setTimeout(() => {
+        scene.remove(flash);
+        scene.remove(ring);
+        trailParticles.forEach(particle => scene.remove(particle));
+    }, 150);
+}
+
+function updateLasersAndAliens(deltaTime) {
+    if (gameOver) return;
+    
+    // Update laser positions
+    for (let i = lasers.length - 1; i >= 0; i--) {
+        const laser = lasers[i];
+        const laserData = laser.userData;
+        
+        // Update laser travel distance
+        const travelSpeed = 70 * deltaTime; // Units per second - increased for better gameplay
+        laserData.distanceTraveled += travelSpeed;
+        
+        // Check for collisions with aliens using raycaster
+        raycaster.set(laserData.startPosition, laserData.direction);
+        const intersects = raycaster.intersectObjects(aliens);
+        
+        let hitAlien = false;
+        let hitDistance = laserData.maxDistance; // Maximum laser travel distance
+        
+        if (intersects.length > 0) {
+            const closestHit = intersects[0];
+            hitDistance = closestHit.distance;
+            
+            // Check if we've traveled far enough to hit the alien
+            if (laserData.distanceTraveled >= hitDistance) {
+                hitAlien = true;
+                
+                // Remove alien
+                const hitAlienObj = closestHit.object;
+                const alienIndex = aliens.indexOf(hitAlienObj);
+                if (alienIndex !== -1) {
+                    scene.remove(hitAlienObj);
+                    aliens.splice(alienIndex, 1);
+                    
+                    // Play alien hit sound
+                    if (alienSound) {
+                        alienSound.currentTime = 0;
+                        alienSound.play().catch(e => console.log("Couldn't play alien sound:", e));
+                    }
+                    
+                    // Create explosion effect
+                    createExplosionEffect(hitAlienObj.position);
+                    
+                    // Create new alien
+                    setTimeout(createNewAlien, 2000);
+                    
+                    score += 10;
+                    updateScoreDisplay();
+                }
+            }
+        }
+        
+        // Update laser length based on travel distance or hit
+        if (hitAlien || laserData.distanceTraveled > hitDistance) {
+            // Create explosion at impact point if it hit something (but wasn't an alien)
+            if (!hitAlien && laserData.distanceTraveled > hitDistance) {
+                const impactPoint = laserData.startPosition.clone().addScaledVector(laserData.direction, hitDistance);
+                createSmallImpactEffect(impactPoint);
+            }
+            
+            // Remove laser if it hit something or traveled too far
+            scene.remove(laser);
+            lasers.splice(i, 1);
+            
+            // If there was trail particles still present, remove them
+            if (laserData.trailParticles) {
+                laserData.trailParticles.forEach(particle => scene.remove(particle));
+            }
+            
+            // If there was a flash/ring effect still present, remove them
+            if (laserData.flash) scene.remove(laserData.flash);
+            if (laserData.ring) scene.remove(laserData.ring);
+        } else {
+            // Update laser position
+            const newPos = laserData.startPosition.clone().addScaledVector(laserData.direction, laserData.distanceTraveled);
+            laser.position.copy(newPos);
+            
+            // Update laser trail particles
+            if (laserData.trailParticles) {
+                for (let j = 0; j < laserData.trailParticles.length; j++) {
+                    const particle = laserData.trailParticles[j];
+                    if (particle) {
+                        const offset = 0.2 + j * 0.1;
+                        particle.position.copy(newPos.clone().addScaledVector(laserData.direction, -offset));
+                        
+                        // Fade out particles over time
+                        const age = Date.now() - laserData.creationTime;
+                        if (age > 200) {
+                            const opacity = Math.max(0, 0.7 - (age - 200) / 300);
+                            particle.material.opacity = opacity;
+                        }
+                    }
+                }
+            }
+            
+            // Update laser length if it's approaching a hit
+            if (laserData.distanceTraveled < hitDistance && hitDistance < laserData.maxDistance) {
+                // Calculate remaining distance to hit
+                const remainingDistance = hitDistance - laserData.distanceTraveled;
+                if (remainingDistance < 5) {
+                    // Adjust laser length to end at hit point
+                    const newLength = Math.max(0.1, remainingDistance);
+                    laser.scale.z = newLength / 5; // 5 is our initial length
+                    
+                    // Also adjust the glow
+                    if (laser.children.length > 0) {
+                        laser.children.forEach(child => {
+                            child.scale.z = newLength / 5;
+                        });
+                    }
+                }
+            }
+            
+            // Remove laser if it's been alive too long
+            if (Date.now() - laserData.creationTime > 5000) {
+                scene.remove(laser);
+                lasers.splice(i, 1);
+                
+                // Remove trail particles
+                if (laserData.trailParticles) {
+                    laserData.trailParticles.forEach(particle => scene.remove(particle));
+                }
+            }
+        }
+    }
+    
+    // Move aliens toward player
+    for (let i = 0; i < aliens.length; i++) {
+        const alien = aliens[i];
+        const alienPosition = alien.position.clone();
+        const direction = new THREE.Vector3();
+        
+        // Direction to camera
+        direction.subVectors(camera.position, alienPosition).normalize();
+        
+        // Move alien toward camera
+        alien.position.addScaledVector(direction, alienSpeed * deltaTime);
+        alien.lookAt(camera.position);
+        
+        // Rotate alien for visual effect
+        alien.rotation.y += 1.0 * deltaTime;
+        
+        // Check if alien is too close to player
+        if (alien.position.distanceTo(camera.position) < 2) {
+            // Game over
+            gameOver = true;
+            
+            // Play game over sound
+            if (gameOverSound) {
+                gameOverSound.currentTime = 0;
+                gameOverSound.play().catch(e => console.log("Couldn't play game over sound:", e));
+            }
+            
+            showGameOverScreen();
+            break;
+        }
+    }
+}
+
+function createExplosionEffect(position) {
+    // Create particles for explosion effect
+    const particleCount = 20;
+    const particles = [];
+    
+    // Create particles
+    for (let i = 0; i < particleCount; i++) {
+        const particle = new THREE.Mesh(
+            new THREE.SphereGeometry(0.1, 8, 8),
+            new THREE.MeshBasicMaterial({
+                color: Math.random() > 0.5 ? 0xff5500 : 0xff0000,
+                transparent: true,
+                opacity: 0.8
+            })
+        );
+        
+        // Random position within a small sphere
+        const angle = Math.random() * Math.PI * 2;
+        const radius = Math.random() * 0.2;
+        particle.position.copy(position);
+        particle.userData = {
+            velocity: new THREE.Vector3(
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2
+            ).normalize().multiplyScalar(Math.random() * 2 + 1),
+            age: 0,
+            maxAge: Math.random() * 500 + 500 // ms
+        };
+        
+        scene.add(particle);
+        particles.push(particle);
+    }
+    
+    // Add a flash of light
+    const light = new THREE.PointLight(0xff5500, 5, 5);
+    light.position.copy(position);
+    scene.add(light);
+    
+    // Animate the explosion
+    const startTime = Date.now();
+    function animateExplosion() {
+        const elapsed = Date.now() - startTime;
+        const lightFade = Math.max(0, 1 - elapsed / 300);
+        
+        light.intensity = 5 * lightFade;
+        
+        // Update particles
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const particle = particles[i];
+            const data = particle.userData;
+            data.age += 16; // Approx ms per frame at 60fps
+            
+            if (data.age >= data.maxAge) {
+                scene.remove(particle);
+                particles.splice(i, 1);
+            } else {
+                const lifeRatio = data.age / data.maxAge;
+                particle.material.opacity = 0.8 * (1 - lifeRatio);
+                particle.scale.set(1 + lifeRatio, 1 + lifeRatio, 1 + lifeRatio);
+                particle.position.add(data.velocity.clone().multiplyScalar(0.05));
+            }
+        }
+        
+        if (elapsed > 1000 || particles.length === 0) {
+            scene.remove(light);
+            return;
+        }
+        
+        requestAnimationFrame(animateExplosion);
+    }
+    
+    animateExplosion();
+}
+
+function createSmallImpactEffect(position) {
+    // Create a small impact effect for when lasers hit non-alien objects
+    const particleCount = 8;
+    const particles = [];
+    
+    // Create particles
+    for (let i = 0; i < particleCount; i++) {
+        const particle = new THREE.Mesh(
+            new THREE.SphereGeometry(0.05, 8, 8),
+            new THREE.MeshBasicMaterial({
+                color: 0xff7700,
+                transparent: true,
+                opacity: 0.8,
+                blending: THREE.AdditiveBlending
+            })
+        );
+        
+        particle.position.copy(position);
+        particle.userData = {
+            velocity: new THREE.Vector3(
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2
+            ).normalize().multiplyScalar(Math.random() + 0.5),
+            age: 0,
+            maxAge: Math.random() * 200 + 200 // ms
+        };
+        
+        scene.add(particle);
+        particles.push(particle);
+    }
+    
+    // Add a flash of light
+    const light = new THREE.PointLight(0xff5500, 3, 3);
+    light.position.copy(position);
+    scene.add(light);
+    
+    // Animate the impact
+    const startTime = Date.now();
+    function animateImpact() {
+        const elapsed = Date.now() - startTime;
+        const lightFade = Math.max(0, 1 - elapsed / 200);
+        
+        light.intensity = 3 * lightFade;
+        
+        // Update particles
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const particle = particles[i];
+            const data = particle.userData;
+            data.age += 16; // Approx ms per frame at 60fps
+            
+            if (data.age >= data.maxAge) {
+                scene.remove(particle);
+                particles.splice(i, 1);
+            } else {
+                const lifeRatio = data.age / data.maxAge;
+                particle.material.opacity = 0.8 * (1 - lifeRatio);
+                particle.scale.set(1 - lifeRatio, 1 - lifeRatio, 1 - lifeRatio);
+                particle.position.add(data.velocity.clone().multiplyScalar(0.03));
+            }
+        }
+        
+        if (elapsed > 500 || particles.length === 0) {
+            scene.remove(light);
+            return;
+        }
+        
+        requestAnimationFrame(animateImpact);
+    }
+    
+    animateImpact();
+}
+
+function toggleSpaceshipMode() {
+    isSpaceshipMode = !isSpaceshipMode;
+    
+    if (isSpaceshipMode) {
+        // Enable spaceship mode
+        controls.enabled = false;
+        fpsControls.enabled = true;
+        spaceshipMesh.visible = false; // Hide the external ship 
+        cockpitContainer.visible = true; // Show cockpit
+        scoreDisplay.style.display = 'block';
+        
+        // Reset mouse button states
+        leftMouseDown = false;
+        rightMouseDown = false;
+        
+        // Reset key states
+        for (let key in keyStates) {
+            keyStates[key] = false;
+        }
+        
+        // Reset score
+        score = 0;
+        updateScoreDisplay();
+        
+        // Create new aliens if needed
+        if (aliens.length === 0) {
+            createAliens();
+        }
+        
+        // Change camera position if needed
+        camera.position.set(0, 0, 30);
+        camera.lookAt(0, 0, 0);
+        
+        // Update instruction display with new controls
+        updateControlInstructions();
+        
+    } else {
+        // Disable spaceship mode
+        fpsControls.enabled = false;
+        controls.enabled = true;
+        spaceshipMesh.visible = false;
+        cockpitContainer.visible = false; // Hide cockpit
+        scoreDisplay.style.display = 'none';
+        
+        // Clean up lasers
+        for (let i = lasers.length - 1; i >= 0; i--) {
+            const laser = lasers[i];
+            scene.remove(laser);
+            lasers.splice(i, 1);
+        }
+    }
+}
+
+// Add function to update the control instructions
+function updateControlInstructions() {
+    // Remove old instructions if they exist
+    const oldInstructions = document.querySelector('.spaceship-instructions');
+    if (oldInstructions) {
+        oldInstructions.remove();
+    }
+    
+    if (isSpaceshipMode) {
+        const controlsPanel = document.getElementById('controls');
+        const instructionsDiv = document.createElement('div');
+        instructionsDiv.className = 'spaceship-instructions';
+        instructionsDiv.style.marginTop = '10px';
+        instructionsDiv.style.padding = '10px';
+        instructionsDiv.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+        instructionsDiv.style.borderRadius = '5px';
+        instructionsDiv.style.fontSize = '12px';
+        
+        instructionsDiv.innerHTML = `
+            <p><strong>Spaceship Controls:</strong></p>
+            <p>W/S or Arrow Keys - Forward/Backward</p>
+            <p>A/D or Arrow Keys - Strafe Left/Right</p>
+            <p>Mouse - Look around</p>
+            <p><strong>HOLD BOTH MOUSE BUTTONS</strong> - Control ship orientation</p>
+            <p>Space - Fire laser</p>
+        `;
+        
+        controlsPanel.appendChild(instructionsDiv);
+    }
+}
+
+function createNewAlien() {
+    // Only create if spaceship mode is active
+    if (!isSpaceshipMode) return;
+    
+    // Create alien at random position
+    const distance = 30 + Math.random() * 20;
+    const angle = Math.random() * Math.PI * 2;
+    
+    // Position in a ring around the player, but not directly in front
+    const x = Math.sin(angle) * distance;
+    const y = (Math.random() - 0.5) * 10;
+    const z = Math.cos(angle) * distance;
+    
+    const alienGeometry = new THREE.SphereGeometry(0.5, 16, 16);
+    const alienMaterial = new THREE.MeshPhongMaterial({ 
+        color: 0x00ff00,
+        emissive: 0x003300,
+        shininess: 30 
+    });
+    const alien = new THREE.Mesh(alienGeometry, alienMaterial);
+    alien.position.set(x, y, z);
+    
+    scene.add(alien);
+    aliens.push(alien);
+}
+
+function onKeyDown(event) {
+    // Prevent spacebar from scrolling the page when in spaceship mode
+    if (isSpaceshipMode && event.code === 'Space') {
+        event.preventDefault();
+    }
+
+    // Handle keypress events
+    if (isSpaceshipMode) {
+        // Spacebar to shoot laser in spaceship mode
+        if (event.code === 'Space') {
+            // Only shoot if the game is not over
+            if (!gameOver) {
+                // Add cooldown to prevent rapid-fire
+                const now = Date.now();
+                const lastShotTime = lastShotTimestamp || 0;
+                const cooldown = 300; // milliseconds
+                
+                if (now - lastShotTime > cooldown) {
+                    shootLaser();
+                    lastShotTimestamp = now;
+                    
+                    // Add recoil effect to the control stick
+                    if (steeringWheel) {
+                        // Save original position
+                        const originalRotationX = steeringWheel.rotation.x;
+                        
+                        // Apply recoil
+                        steeringWheel.rotation.x += 0.1;
+                        
+                        // Return to original position
+                        setTimeout(() => {
+                            if (steeringWheel) {
+                                steeringWheel.rotation.x = originalRotationX;
+                            }
+                        }, 100);
+                    }
+                }
+            } else {
+                // If game is over, pressing space restarts the game
+                // Remove game over screen if it exists
+                const gameOverScreen = document.querySelector('div[style*="position: absolute"][style*="zIndex: 1000"]');
+                if (gameOverScreen) {
+                    document.body.removeChild(gameOverScreen);
+                }
+                
+                // Reset game state
+                gameOver = false;
+                score = 0;
+                updateScoreDisplay();
+                
+                // Remove all existing aliens
+                for (let i = aliens.length - 1; i >= 0; i--) {
+                    scene.remove(aliens[i]);
+                }
+                aliens = [];
+                
+                // Create new aliens
+                createAliens();
+            }
+        }
+        
+        // Arrow keys for additional steering control
+        if (event.code === 'ArrowUp') {
+            // Pitch down (look up)
+            camera.rotation.x += 0.05;
+            if (steeringWheel) {
+                steeringWheel.rotation.x += 0.1;
+            }
+        }
+        
+        if (event.code === 'ArrowDown') {
+            // Pitch up (look down)
+            camera.rotation.x -= 0.05;
+            if (steeringWheel) {
+                steeringWheel.rotation.x -= 0.1;
+            }
+        }
+        
+        if (event.code === 'ArrowLeft') {
+            // Roll left
+            camera.rotation.z += 0.05;
+            if (steeringWheel) {
+                steeringWheel.rotation.z -= 0.1;
+            }
+        }
+        
+        if (event.code === 'ArrowRight') {
+            // Roll right
+            camera.rotation.z -= 0.05;
+            if (steeringWheel) {
+                steeringWheel.rotation.z += 0.1;
+            }
+        }
+        
+        // WASD keys for manual movement
+        if (event.code === 'KeyW') {
+            // Move forward
+            const forwardVector = new THREE.Vector3(0, 0, -1);
+            forwardVector.applyQuaternion(camera.quaternion);
+            camera.position.addScaledVector(forwardVector, 1);
+        }
+        
+        if (event.code === 'KeyS') {
+            // Move backward
+            const forwardVector = new THREE.Vector3(0, 0, -1);
+            forwardVector.applyQuaternion(camera.quaternion);
+            camera.position.addScaledVector(forwardVector, -1);
+        }
+        
+        if (event.code === 'KeyA') {
+            // Strafe left
+            const rightVector = new THREE.Vector3(1, 0, 0);
+            rightVector.applyQuaternion(camera.quaternion);
+            camera.position.addScaledVector(rightVector, -1);
+        }
+        
+        if (event.code === 'KeyD') {
+            // Strafe right
+            const rightVector = new THREE.Vector3(1, 0, 0);
+            rightVector.applyQuaternion(camera.quaternion);
+            camera.position.addScaledVector(rightVector, 1);
+        }
+        
+        // Boost with Shift
+        if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
+            // Temporarily increase movement speed
+            fpsControls.movementSpeed = config.spaceship.speed * 50;
+            
+            // Show boost effect in cockpit - flash throttle control
+            if (cockpitContainer) {
+                // Find the throttle lever in the cockpit
+                cockpitContainer.traverse(function(child) {
+                    if (child.name === 'throttleLever') {
+                        // Save original color
+                        const originalColor = child.material.color.clone();
+                        const originalEmissive = child.material.emissive.clone();
+                        
+                        // Set boost color
+                        child.material.color.setHex(0xff5500);
+                        child.material.emissive.setHex(0x551100);
+                        
+                        // Return to original color
+                        setTimeout(() => {
+                            child.material.color.copy(originalColor);
+                            child.material.emissive.copy(originalEmissive);
+                        }, 300);
+                    }
+                });
+            }
+        }
+    } 
+}
+
+// Add key up handler for boost end
+function onKeyUp(event) {
+    // Reset boost speed
+    if ((event.code === 'ShiftLeft' || event.code === 'ShiftRight') && isSpaceshipMode) {
+        fpsControls.movementSpeed = config.spaceship.speed * 30;
+    }
+}
+
+function showGameOverScreen() {
+    // Create game over screen overlay
+    const gameOverDiv = document.createElement('div');
+    gameOverDiv.style.position = 'absolute';
+    gameOverDiv.style.top = '0';
+    gameOverDiv.style.left = '0';
+    gameOverDiv.style.width = '100%';
+    gameOverDiv.style.height = '100%';
+    gameOverDiv.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+    gameOverDiv.style.display = 'flex';
+    gameOverDiv.style.flexDirection = 'column';
+    gameOverDiv.style.justifyContent = 'center';
+    gameOverDiv.style.alignItems = 'center';
+    gameOverDiv.style.zIndex = '1000';
+    
+    // Game over text
+    const gameOverText = document.createElement('h1');
+    gameOverText.textContent = 'GAME OVER';
+    gameOverText.style.color = '#ff0000';
+    gameOverText.style.fontSize = '48px';
+    gameOverText.style.marginBottom = '20px';
+    gameOverText.style.fontFamily = 'Arial, sans-serif';
+    gameOverText.style.textShadow = '0 0 10px #ff0000';
+    
+    // Score display
+    const finalScore = document.createElement('h2');
+    finalScore.textContent = `Final Score: ${score}`;
+    finalScore.style.color = '#ffffff';
+    finalScore.style.fontSize = '24px';
+    finalScore.style.marginBottom = '30px';
+    finalScore.style.fontFamily = 'Arial, sans-serif';
+    
+    // Restart button
+    const restartButton = document.createElement('button');
+    restartButton.textContent = 'Restart Game';
+    restartButton.style.padding = '12px 24px';
+    restartButton.style.fontSize = '18px';
+    restartButton.style.backgroundColor = '#4CAF50';
+    restartButton.style.color = 'white';
+    restartButton.style.border = 'none';
+    restartButton.style.borderRadius = '5px';
+    restartButton.style.cursor = 'pointer';
+    restartButton.style.marginBottom = '20px';
+    
+    restartButton.addEventListener('click', function() {
+        // Reset game state
+        gameOver = false;
+        score = 0;
+        updateScoreDisplay();
+        
+        // Remove all existing aliens
+        for (let i = aliens.length - 1; i >= 0; i--) {
+            scene.remove(aliens[i]);
+        }
+        aliens = [];
+        
+        // Create new aliens
+        createAliens();
+        
+        // Remove game over screen
+        document.body.removeChild(gameOverDiv);
+    });
+    
+    // Exit button
+    const exitButton = document.createElement('button');
+    exitButton.textContent = 'Exit to Exploration Mode';
+    exitButton.style.padding = '12px 24px';
+    exitButton.style.fontSize = '18px';
+    exitButton.style.backgroundColor = '#f44336';
+    exitButton.style.color = 'white';
+    exitButton.style.border = 'none';
+    exitButton.style.borderRadius = '5px';
+    exitButton.style.cursor = 'pointer';
+    
+    exitButton.addEventListener('click', function() {
+        // Exit spaceship mode
+        toggleSpaceshipMode();
+        
+        // Remove game over screen
+        document.body.removeChild(gameOverDiv);
+    });
+    
+    // Add elements to the overlay
+    gameOverDiv.appendChild(gameOverText);
+    gameOverDiv.appendChild(finalScore);
+    gameOverDiv.appendChild(restartButton);
+    gameOverDiv.appendChild(exitButton);
+    document.body.appendChild(gameOverDiv);
+}
+
+// Add mouse event listeners for dual-button controls
+document.addEventListener('mousedown', onMouseDown);
+document.addEventListener('mouseup', onMouseUp);
+document.addEventListener('mousemove', onMouseMove);
+
+// Track mouse buttons state
+let leftMouseDown = false;
+let rightMouseDown = false;
+
+function onMouseDown(event) {
+    if (isSpaceshipMode) {
+        if (event.button === 0) {
+            leftMouseDown = true;
+        } else if (event.button === 2) {
+            rightMouseDown = true;
+            // Prevent context menu when right-clicking in spaceship mode
+            event.preventDefault();
+        }
+    }
+}
+
+function onMouseUp(event) {
+    if (isSpaceshipMode) {
+        if (event.button === 0) {
+            leftMouseDown = false;
+        } else if (event.button === 2) {
+            rightMouseDown = false;
+        }
+    }
+}
+
+function onMouseMove(event) {
+    if (isSpaceshipMode && leftMouseDown && rightMouseDown) {
+        // Only control orientation when both mouse buttons are pressed
+        // Calculate movement delta
+        const movementX = event.movementX || 0;
+        const movementY = event.movementY || 0;
+        
+        // Adjust camera rotation based on mouse movement
+        // This works together with the FPS controls
+        const rotationSpeed = 0.002;
+        camera.rotation.y -= movementX * rotationSpeed;
+        
+        // Limit vertical rotation to prevent flipping
+        const currentPitch = camera.rotation.x + (movementY * rotationSpeed);
+        const maxPitch = Math.PI / 3; // Limit to about 60 degrees up/down
+        if (currentPitch < maxPitch && currentPitch > -maxPitch) {
+            camera.rotation.x = currentPitch;
+        }
+        
+        // Update the cockpit orientation to match the camera
+        if (cockpitContainer) {
+            cockpitContainer.quaternion.copy(camera.quaternion);
+        }
+    }
+}
+
+// Prevent context menu from appearing with right-click in spaceship mode
+document.addEventListener('contextmenu', function(event) {
+    if (isSpaceshipMode) {
+        event.preventDefault();
+    }
+});
+
+// Add key states tracking for smoother movement
+const keyStates = {};
+
+document.addEventListener('keydown', (event) => {
+    keyStates[event.code] = true;
+    // Still call the regular onKeyDown for other functionality
+    onKeyDown(event);
+});
+
+document.addEventListener('keyup', (event) => {
+    keyStates[event.code] = false;
+    // Still call the regular onKeyUp for other functionality
+    onKeyUp(event);
+});
