@@ -1,0 +1,899 @@
+import * as THREE from './js/three/three.module.js';
+import { OrbitControls } from './js/three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from './js/three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from './js/three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from './js/three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from './js/three/examples/jsm/postprocessing/ShaderPass.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000816);
+
+// Camera setup
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.z = 30;
+
+// Renderer setup
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.25;
+document.body.appendChild(renderer.domElement);
+
+// Post-processing setup
+const renderScene = new RenderPass(scene, camera);
+
+const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    1.5,   // strength
+    0.4,   // radius
+    0.85   // threshold
+);
+
+// Custom film grain effect
+const filmGrainShader = {
+    uniforms: {
+        tDiffuse: { value: null },
+        time: { value: 0 },
+        amount: { value: 0.08 },
+        speed: { value: 0.5 }
+    },
+    vertexShader: `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `,
+    fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float time;
+        uniform float amount;
+        uniform float speed;
+        varying vec2 vUv;
+        
+        float random(vec2 co) {
+            return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        }
+        
+        void main() {
+            vec4 color = texture2D(tDiffuse, vUv);
+            float noise = random(vUv + time * speed) * amount;
+            color.rgb += noise;
+            gl_FragColor = color;
+        }
+    `
+};
+
+const filmGrainPass = new ShaderPass(filmGrainShader);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(renderScene);
+composer.addPass(bloomPass);
+composer.addPass(filmGrainPass);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.enableZoom = true;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.5;
+
+// Clock for animations
+const clock = new THREE.Clock();
+
+// Mouse interaction
+const mouse = new THREE.Vector2();
+const mouseTarget = new THREE.Vector3();
+let mouseDown = false;
+let isContinuousMode = false;
+
+// Audio setup
+let audioListener, audioLoader, sound, analyser;
+let audioConnected = false;
+
+function initAudio() {
+    audioListener = new THREE.AudioListener();
+    camera.add(audioListener);
+    sound = new THREE.Audio(audioListener);
+    audioLoader = new THREE.AudioLoader();
+    
+    navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        .then(function(stream) {
+            sound.setMediaStreamSource(stream);
+            analyser = new THREE.AudioAnalyser(sound, 128);
+            audioConnected = true;
+        })
+        .catch(function(err) {
+            console.log('Audio input error: ' + err);
+        });
+}
+
+// Environment
+function initEnvironment() {
+    // Subtle ambient light
+    const ambientLight = new THREE.AmbientLight(0x222233, 0.5);
+    scene.add(ambientLight);
+    
+    // Directional light for subtle shadows
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+    directionalLight.position.set(5, 10, 7);
+    scene.add(directionalLight);
+    
+    // Background stars
+    const starGeometry = new THREE.BufferGeometry();
+    const starCount = 1000;
+    const starPositions = new Float32Array(starCount * 3);
+    const starSizes = new Float32Array(starCount);
+    
+    for (let i = 0; i < starCount; i++) {
+        const i3 = i * 3;
+        // Position stars in a large sphere around the scene
+        const radius = 150 + Math.random() * 150;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        
+        starPositions[i3] = radius * Math.sin(phi) * Math.cos(theta);
+        starPositions[i3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
+        starPositions[i3 + 2] = radius * Math.cos(phi);
+        
+        starSizes[i] = Math.random() * 2;
+    }
+    
+    starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+    starGeometry.setAttribute('size', new THREE.BufferAttribute(starSizes, 1));
+    
+    const starMaterial = new THREE.PointsMaterial({
+        size: 0.5,
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.8,
+        sizeAttenuation: true
+    });
+    
+    const stars = new THREE.Points(starGeometry, starMaterial);
+    scene.add(stars);
+}
+
+// Advanced Particle System with custom shaders
+class ParticleCloud {
+    constructor(options) {
+        this.options = Object.assign({
+            count: 15000,
+            particleSize: 0.12,
+            particleSizeVariation: 0.05,
+            baseColor: new THREE.Color(0x4466ff),
+            secondaryColor: new THREE.Color(0xff66aa),
+            tertiaryColor: new THREE.Color(0x66ffaa),
+            speedFactor: 1.0,
+            noiseIntensity: 3.0,
+            noiseTimeScale: 0.5,
+            particleLifespan: 5.0,
+            emissionRate: 0.5,
+            turbulence: 0.5,
+            interactiveForce: 0.1
+        }, options);
+
+        this.time = 0;
+        this.particles = [];
+        this.colors = [this.options.baseColor, this.options.secondaryColor, this.options.tertiaryColor];
+        
+        this.initialize();
+    }
+
+    initialize() {
+        // Create texture for particles
+        const particleTexture = this.createParticleTexture();
+        
+        // Geometry and attribute setup
+        this.geometry = new THREE.BufferGeometry();
+        
+        // Create arrays for positions, velocities, colors, etc.
+        this.positions = new Float32Array(this.options.count * 3);
+        this.velocities = new Float32Array(this.options.count * 3);
+        this.accelerations = new Float32Array(this.options.count * 3);
+        this.colors = new Float32Array(this.options.count * 3);
+        this.sizes = new Float32Array(this.options.count);
+        this.lifeTimes = new Float32Array(this.options.count);
+        this.startTimes = new Float32Array(this.options.count);
+        this.opacities = new Float32Array(this.options.count);
+        
+        // Initialize particle properties
+        for (let i = 0; i < this.options.count; i++) {
+            this.initParticle(i);
+        }
+        
+        this.geometry.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
+        this.geometry.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
+        this.geometry.setAttribute('size', new THREE.BufferAttribute(this.sizes, 1));
+        this.geometry.setAttribute('opacity', new THREE.BufferAttribute(this.opacities, 1));
+        
+        // Custom shader material
+        this.material = new THREE.ShaderMaterial({
+            uniforms: {
+                time: { value: 0 },
+                particleTexture: { value: particleTexture },
+                audioLevel: { value: 0 }
+            },
+            vertexShader: `
+                attribute float size;
+                attribute float opacity;
+                attribute vec3 color;
+                varying vec3 vColor;
+                varying float vOpacity;
+                uniform float time;
+                uniform float audioLevel;
+                
+                void main() {
+                    vColor = color;
+                    vOpacity = opacity;
+                    
+                    // Add subtle pulsing based on time and audio
+                    float pulse = 1.0 + sin(time * 2.0) * 0.1 + audioLevel * 0.5;
+                    
+                    // Calculate position with slight oscillation
+                    vec3 posModified = position;
+                    posModified.x += sin(time * 0.5 + position.z * 0.05) * 0.2 * audioLevel;
+                    posModified.y += cos(time * 0.5 + position.x * 0.05) * 0.2 * audioLevel;
+                    posModified.z += sin(time * 0.3 + position.y * 0.05) * 0.2 * audioLevel;
+                    
+                    vec4 mvPosition = modelViewMatrix * vec4(posModified, 1.0);
+                    gl_PointSize = size * pulse * (300.0 / -mvPosition.z);
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D particleTexture;
+                varying vec3 vColor;
+                varying float vOpacity;
+                
+                void main() {
+                    // Sample the texture
+                    vec4 texColor = texture2D(particleTexture, gl_PointCoord);
+                    
+                    // Apply a subtle color gradient based on position in point
+                    vec3 finalColor = vColor;
+                    float distFromCenter = length(gl_PointCoord - vec2(0.5));
+                    finalColor = mix(finalColor, finalColor * 1.5, distFromCenter);
+                    
+                    // Set final color with opacity
+                    gl_FragColor = vec4(finalColor, texColor.a * vOpacity);
+                    
+                    // Discard nearly transparent pixels
+                    if (gl_FragColor.a < 0.05) discard;
+                }
+            `,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        
+        // Create the particle system
+        this.particleSystem = new THREE.Points(this.geometry, this.material);
+        scene.add(this.particleSystem);
+        
+        // Create additional emitters
+        this.createEmitters();
+    }
+    
+    createParticleTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 128;
+        const ctx = canvas.getContext('2d');
+        
+        // Create a soft, glowing particle
+        const gradient = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+        gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+        gradient.addColorStop(0.3, 'rgba(200, 200, 255, 0.8)');
+        gradient.addColorStop(0.7, 'rgba(150, 150, 255, 0.4)');
+        gradient.addColorStop(1, 'rgba(0, 0, 64, 0)');
+        
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 128, 128);
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.needsUpdate = true;
+        
+        return texture;
+    }
+    
+    createEmitters() {
+        // Add three orbiting emitters
+        this.emitters = [];
+        
+        for (let i = 0; i < 3; i++) {
+            const emitter = {
+                position: new THREE.Vector3(
+                    15 * Math.cos(i * Math.PI * 2 / 3),
+                    8 * Math.sin(i * Math.PI * 2 / 3),
+                    0
+                ),
+                radius: 2 + Math.random() * 3,
+                power: 0.5 + Math.random() * 1.5,
+                color: this.colors[i % this.colors.length],
+                angle: i * Math.PI * 2 / 3
+            };
+            this.emitters.push(emitter);
+        }
+    }
+    
+    initParticle(i, fromEmitter = -1) {
+        const idx = i * 3;
+        
+        // Position
+        if (fromEmitter >= 0 && fromEmitter < this.emitters.length) {
+            const emitter = this.emitters[fromEmitter];
+            const radius = Math.random() * 1.5;
+            const theta = Math.random() * 2 * Math.PI;
+            const phi = Math.random() * 2 * Math.PI;
+            
+            this.positions[idx] = emitter.position.x + radius * Math.sin(phi) * Math.cos(theta);
+            this.positions[idx + 1] = emitter.position.y + radius * Math.sin(phi) * Math.sin(theta);
+            this.positions[idx + 2] = emitter.position.z + radius * Math.cos(phi);
+            
+            // Velocity - outward from emitter
+            const speed = 0.5 + Math.random() * emitter.power;
+            const dir = new THREE.Vector3(
+                this.positions[idx] - emitter.position.x,
+                this.positions[idx + 1] - emitter.position.y,
+                this.positions[idx + 2] - emitter.position.z
+            ).normalize();
+            
+            this.velocities[idx] = dir.x * speed;
+            this.velocities[idx + 1] = dir.y * speed;
+            this.velocities[idx + 2] = dir.z * speed;
+            
+            // Color from emitter
+            let colorIndex = fromEmitter % this.colors.length;
+            const col = new THREE.Color().lerpColors(
+                this.options.baseColor,
+                this.options[['secondaryColor', 'tertiaryColor'][colorIndex % 2]],
+                Math.random()
+            );
+            
+            this.colors[idx] = col.r;
+            this.colors[idx + 1] = col.g;
+            this.colors[idx + 2] = col.b;
+        } else {
+            // Random position within a sphere
+            const radius = 5 + Math.random() * 15;
+            const theta = Math.random() * 2 * Math.PI;
+            const phi = Math.random() * 2 * Math.PI;
+            
+            this.positions[idx] = radius * Math.sin(phi) * Math.cos(theta);
+            this.positions[idx + 1] = radius * Math.sin(phi) * Math.sin(theta);
+            this.positions[idx + 2] = radius * Math.cos(phi);
+            
+            // Random velocity
+            this.velocities[idx] = (Math.random() - 0.5) * 0.3;
+            this.velocities[idx + 1] = (Math.random() - 0.5) * 0.3;
+            this.velocities[idx + 2] = (Math.random() - 0.5) * 0.3;
+            
+            // Random color from gradient
+            const colorFactor = Math.random();
+            let col;
+            
+            if (colorFactor < 0.33) {
+                col = new THREE.Color().lerpColors(this.options.baseColor, this.options.secondaryColor, Math.random());
+            } else if (colorFactor < 0.66) {
+                col = new THREE.Color().lerpColors(this.options.secondaryColor, this.options.tertiaryColor, Math.random());
+            } else {
+                col = new THREE.Color().lerpColors(this.options.tertiaryColor, this.options.baseColor, Math.random());
+            }
+            
+            this.colors[idx] = col.r;
+            this.colors[idx + 1] = col.g;
+            this.colors[idx + 2] = col.b;
+        }
+        
+        // Acceleration (initially zero)
+        this.accelerations[idx] = 0;
+        this.accelerations[idx + 1] = 0;
+        this.accelerations[idx + 2] = 0;
+        
+        // Size with variation
+        this.sizes[i] = this.options.particleSize + (Math.random() - 0.5) * this.options.particleSizeVariation;
+        
+        // Lifetime and start time
+        this.lifeTimes[i] = this.options.particleLifespan * (0.6 + Math.random() * 0.4);
+        this.startTimes[i] = fromEmitter >= 0 ? this.time : this.time - Math.random() * this.options.particleLifespan;
+        
+        // Opacity
+        this.opacities[i] = 0.8 + Math.random() * 0.2;
+    }
+    
+    update(delta) {
+        this.time += delta;
+        
+        // Update shader uniforms
+        this.material.uniforms.time.value = this.time;
+        
+        // Update with audio input
+        if (audioConnected) {
+            const audioLevel = analyser.getAverageFrequency() / 256.0;
+            this.material.uniforms.audioLevel.value = Math.min(audioLevel * 2, 1.0);
+        }
+        
+        // Update emitter positions
+        for (let i = 0; i < this.emitters.length; i++) {
+            const emitter = this.emitters[i];
+            emitter.angle += delta * 0.2 * (i % 2 === 0 ? 1 : -1);
+            
+            emitter.position.x = 15 * Math.cos(emitter.angle);
+            emitter.position.y = 8 * Math.sin(emitter.angle);
+            emitter.position.z = 5 * Math.sin(emitter.angle * 2);
+        }
+        
+        // Update particle positions and properties
+        let particlesToReset = 0;
+        
+        for (let i = 0; i < this.options.count; i++) {
+            const idx = i * 3;
+            
+            // Check if particle is alive
+            const age = this.time - this.startTimes[i];
+            if (age >= this.lifeTimes[i]) {
+                // Reset particle from a random emitter
+                const emitterIndex = Math.floor(Math.random() * this.emitters.length);
+                this.initParticle(i, emitterIndex);
+                particlesToReset++;
+                continue;
+            }
+            
+            // Life factor (1 -> 0)
+            const lifeFactor = 1 - age / this.lifeTimes[i];
+            
+            // Apply acceleration to velocity
+            this.velocities[idx] += this.accelerations[idx] * delta;
+            this.velocities[idx + 1] += this.accelerations[idx + 1] * delta;
+            this.velocities[idx + 2] += this.accelerations[idx + 2] * delta;
+            
+            // Apply turbulence using noise
+            const noiseX = this.noise(this.positions[idx] * 0.1, this.positions[idx + 1] * 0.1, this.time * this.options.noiseTimeScale) * this.options.turbulence;
+            const noiseY = this.noise(this.positions[idx + 1] * 0.1, this.positions[idx + 2] * 0.1, this.time * this.options.noiseTimeScale) * this.options.turbulence;
+            const noiseZ = this.noise(this.positions[idx + 2] * 0.1, this.positions[idx] * 0.1, this.time * this.options.noiseTimeScale) * this.options.turbulence;
+            
+            this.velocities[idx] += noiseX * delta;
+            this.velocities[idx + 1] += noiseY * delta;
+            this.velocities[idx + 2] += noiseZ * delta;
+            
+            // Apply mouse interaction if mouse is down
+            if (mouseDown || isContinuousMode) {
+                const particlePos = new THREE.Vector3(
+                    this.positions[idx],
+                    this.positions[idx + 1],
+                    this.positions[idx + 2]
+                );
+                
+                const toMouse = new THREE.Vector3().subVectors(mouseTarget, particlePos);
+                const distance = toMouse.length();
+                
+                // Make influence radius responsive to camera distance
+                const influenceRadius = 20 * (camera.position.z / 30);
+                
+                if (distance < influenceRadius) {
+                    const force = influenceRadius - distance;
+                    toMouse.normalize().multiplyScalar(force * this.options.interactiveForce * delta);
+                    
+                    this.velocities[idx] += toMouse.x;
+                    this.velocities[idx + 1] += toMouse.y;
+                    this.velocities[idx + 2] += toMouse.z;
+                }
+            }
+            
+            // Damping
+            this.velocities[idx] *= 0.99;
+            this.velocities[idx + 1] *= 0.99;
+            this.velocities[idx + 2] *= 0.99;
+            
+            // Apply velocity to position
+            this.positions[idx] += this.velocities[idx] * delta * this.options.speedFactor;
+            this.positions[idx + 1] += this.velocities[idx + 1] * delta * this.options.speedFactor;
+            this.positions[idx + 2] += this.velocities[idx + 2] * delta * this.options.speedFactor;
+            
+            // Apply audio reactivity to size for a pulsing effect
+            if (audioConnected) {
+                const audioLevel = this.material.uniforms.audioLevel.value;
+                this.sizes[i] = (this.options.particleSize + Math.sin(age * 2) * 0.03) * lifeFactor * (1 + audioLevel * 0.5);
+            } else {
+                this.sizes[i] = (this.options.particleSize + Math.sin(age * 2) * 0.03) * lifeFactor;
+            }
+            
+            // Fade opacity near the end of life
+            if (lifeFactor < 0.3) {
+                this.opacities[i] = lifeFactor / 0.3;
+            }
+        }
+        
+        // Update the buffers
+        this.geometry.attributes.position.needsUpdate = true;
+        this.geometry.attributes.color.needsUpdate = true;
+        this.geometry.attributes.size.needsUpdate = true;
+        this.geometry.attributes.opacity.needsUpdate = true;
+        
+        // Update the system according to speed
+        this.particleSystem.rotation.y += delta * 0.01 * this.options.speedFactor;
+    }
+    
+    // Simple Perlin noise implementation for turbulence
+    noise(x, y, z) {
+        return (Math.sin(x * 10 + this.time) * Math.cos(y * 8 - this.time) * Math.sin(z * 5 + this.time * 0.5)) * this.options.noiseIntensity;
+    }
+    
+    // Change color scheme
+    changeColors(baseColor, secondaryColor, tertiaryColor) {
+        this.options.baseColor = baseColor;
+        this.options.secondaryColor = secondaryColor;
+        this.options.tertiaryColor = tertiaryColor;
+    }
+    
+    // Change speed
+    setSpeed(speed) {
+        this.options.speedFactor = speed;
+    }
+    
+    // Change interactivity
+    setInteractivity(force) {
+        this.options.interactiveForce = force;
+    }
+    
+    // Change turbulence
+    setTurbulence(turbulence) {
+        this.options.turbulence = turbulence;
+    }
+    
+    // Change mouse mode
+    setMouseMode(isAttractMode) {
+        this.options.interactiveForce = isAttractMode ? 0.1 : -0.1;
+    }
+    
+    // Set bloom intensity
+    setBloomIntensity(intensity) {
+        bloomPass.strength = intensity;
+    }
+}
+
+// Initialize environment
+initEnvironment();
+
+// Initialize audio
+initAudio();
+
+// Create the particle system
+const particleCloud = new ParticleCloud();
+
+// Modern color schemes with more professional palettes
+const colorSchemes = [
+    { name: 'Cosmic Aurora', colors: [0x4466ff, 0xff66aa, 0x66ffaa] },
+    { name: 'Neon Nights', colors: [0xff00cc, 0x00ffcc, 0xffcc00] },
+    { name: 'Ocean Depths', colors: [0x0088ff, 0x00ddff, 0x0033aa] },
+    { name: 'Cyberpunk', colors: [0xff2a6d, 0x05d9e8, 0xdefe47] },
+    { name: 'Sunset Gradient', colors: [0xff7b00, 0xff8800, 0xffb700] },
+    { name: 'Northern Lights', colors: [0x39ff14, 0x00ffff, 0x875fff] },
+    { name: 'Galaxy Core', colors: [0xd600ff, 0xff00aa, 0x9000ff] },
+    { name: 'Retro Wave', colors: [0xfc00ff, 0x00dbde, 0xffff00] }
+];
+
+// Mouse event handlers
+function onMouseMove(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    
+    const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
+    vector.unproject(camera);
+    
+    const dir = vector.sub(camera.position).normalize();
+    const distance = -camera.position.z / dir.z;
+    
+    mouseTarget.copy(camera.position).add(dir.multiplyScalar(distance));
+}
+
+function onMouseDown() {
+    mouseDown = true;
+    controls.autoRotate = false;
+}
+
+function onMouseUp() {
+    mouseDown = false;
+    controls.autoRotate = true;
+}
+
+window.addEventListener('mousemove', onMouseMove, false);
+window.addEventListener('mousedown', onMouseDown, false);
+window.addEventListener('mouseup', onMouseUp, false);
+window.addEventListener('touchstart', onMouseDown, false);
+window.addEventListener('touchend', onMouseUp, false);
+window.addEventListener('touchmove', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onMouseMove({
+        clientX: event.touches[0].clientX,
+        clientY: event.touches[0].clientY
+    });
+}, { passive: false });
+
+// UI Controls
+function createUI() {
+    const panel = document.createElement('div');
+    panel.style.position = 'absolute';
+    panel.style.top = '10px';
+    panel.style.right = '10px';
+    panel.style.background = 'rgba(0,10,20,0.8)';
+    panel.style.padding = '15px';
+    panel.style.borderRadius = '12px';
+    panel.style.color = 'white';
+    panel.style.zIndex = '100';
+    panel.style.fontFamily = 'Arial, sans-serif';
+    panel.style.width = '260px';
+    panel.style.boxShadow = '0 0 20px rgba(0,100,255,0.3)';
+    panel.style.backdropFilter = 'blur(10px)';
+    panel.style.border = '1px solid rgba(100,200,255,0.3)';
+    document.body.appendChild(panel);
+    
+    // Title
+    const title = document.createElement('h3');
+    title.textContent = 'Cosmic Particle System';
+    title.style.margin = '0 0 15px 0';
+    title.style.textAlign = 'center';
+    title.style.fontSize = '18px';
+    title.style.color = '#88ddff';
+    title.style.textShadow = '0 0 10px rgba(50,150,255,0.8)';
+    panel.appendChild(title);
+    
+    // Audio toggle
+    const audioContainer = document.createElement('div');
+    audioContainer.style.display = 'flex';
+    audioContainer.style.alignItems = 'center';
+    audioContainer.style.justifyContent = 'space-between';
+    audioContainer.style.marginBottom = '15px';
+    
+    const audioLabel = document.createElement('span');
+    audioLabel.textContent = 'Audio Reactive:';
+    audioContainer.appendChild(audioLabel);
+    
+    const audioToggle = document.createElement('button');
+    audioToggle.textContent = 'Enable';
+    audioToggle.style.padding = '5px 10px';
+    audioToggle.style.backgroundColor = '#333';
+    audioToggle.style.color = 'white';
+    audioToggle.style.border = '1px solid #555';
+    audioToggle.style.borderRadius = '5px';
+    audioToggle.style.cursor = 'pointer';
+    
+    audioToggle.addEventListener('click', () => {
+        if (!audioConnected) {
+            initAudio();
+            audioToggle.textContent = 'Connecting...';
+            setTimeout(() => {
+                if (audioConnected) {
+                    audioToggle.textContent = 'Enabled';
+                    audioToggle.style.backgroundColor = '#39C';
+                } else {
+                    audioToggle.textContent = 'Failed';
+                    audioToggle.style.backgroundColor = '#C33';
+                }
+            }, 1000);
+        }
+    });
+    
+    audioContainer.appendChild(audioToggle);
+    panel.appendChild(audioContainer);
+    
+    // Color schemes
+    const colorLabel = document.createElement('div');
+    colorLabel.textContent = 'Color Scheme:';
+    colorLabel.style.marginBottom = '5px';
+    panel.appendChild(colorLabel);
+    
+    const colorSelect = document.createElement('select');
+    colorSelect.style.width = '100%';
+    colorSelect.style.marginBottom = '15px';
+    colorSelect.style.padding = '6px 8px';
+    colorSelect.style.backgroundColor = '#222';
+    colorSelect.style.color = 'white';
+    colorSelect.style.border = '1px solid #444';
+    colorSelect.style.borderRadius = '6px';
+    
+    colorSchemes.forEach((scheme, index) => {
+        const option = document.createElement('option');
+        option.value = index;
+        option.textContent = scheme.name;
+        colorSelect.appendChild(option);
+    });
+    
+    colorSelect.addEventListener('change', (e) => {
+        const scheme = colorSchemes[e.target.value];
+        particleCloud.changeColors(
+            new THREE.Color(scheme.colors[0]),
+            new THREE.Color(scheme.colors[1]),
+            new THREE.Color(scheme.colors[2])
+        );
+    });
+    panel.appendChild(colorSelect);
+    
+    // Bloom intensity
+    const bloomLabel = document.createElement('div');
+    bloomLabel.textContent = 'Bloom Intensity: 1.5';
+    bloomLabel.style.marginBottom = '5px';
+    panel.appendChild(bloomLabel);
+    
+    const bloomSlider = document.createElement('input');
+    bloomSlider.type = 'range';
+    bloomSlider.min = '0';
+    bloomSlider.max = '3';
+    bloomSlider.step = '0.1';
+    bloomSlider.value = '1.5';
+    bloomSlider.style.width = '100%';
+    bloomSlider.style.marginBottom = '15px';
+    bloomSlider.addEventListener('input', (e) => {
+        const bloom = parseFloat(e.target.value);
+        particleCloud.setBloomIntensity(bloom);
+        bloomLabel.textContent = `Bloom Intensity: ${bloom.toFixed(1)}`;
+    });
+    panel.appendChild(bloomSlider);
+    
+    // Speed control
+    const speedLabel = document.createElement('div');
+    speedLabel.textContent = 'Animation Speed: 1.0x';
+    speedLabel.style.marginBottom = '5px';
+    panel.appendChild(speedLabel);
+    
+    const speedSlider = document.createElement('input');
+    speedSlider.type = 'range';
+    speedSlider.min = '0.1';
+    speedSlider.max = '3';
+    speedSlider.step = '0.1';
+    speedSlider.value = '1';
+    speedSlider.style.width = '100%';
+    speedSlider.style.marginBottom = '15px';
+    speedSlider.addEventListener('input', (e) => {
+        const speed = parseFloat(e.target.value);
+        particleCloud.setSpeed(speed);
+        speedLabel.textContent = `Animation Speed: ${speed.toFixed(1)}x`;
+    });
+    panel.appendChild(speedSlider);
+    
+    // Turbulence control
+    const turbLabel = document.createElement('div');
+    turbLabel.textContent = 'Turbulence: 0.5';
+    turbLabel.style.marginBottom = '5px';
+    panel.appendChild(turbLabel);
+    
+    const turbSlider = document.createElement('input');
+    turbSlider.type = 'range';
+    turbSlider.min = '0';
+    turbSlider.max = '2';
+    turbSlider.step = '0.1';
+    turbSlider.value = '0.5';
+    turbSlider.style.width = '100%';
+    turbSlider.style.marginBottom = '15px';
+    turbSlider.addEventListener('input', (e) => {
+        const turb = parseFloat(e.target.value);
+        particleCloud.setTurbulence(turb);
+        turbLabel.textContent = `Turbulence: ${turb.toFixed(1)}`;
+    });
+    panel.appendChild(turbSlider);
+    
+    // Interactivity control
+    const interactiveLabel = document.createElement('div');
+    interactiveLabel.textContent = 'Mouse Influence: 0.1';
+    interactiveLabel.style.marginBottom = '5px';
+    panel.appendChild(interactiveLabel);
+    
+    const interactiveSlider = document.createElement('input');
+    interactiveSlider.type = 'range';
+    interactiveSlider.min = '0';
+    interactiveSlider.max = '0.5';
+    interactiveSlider.step = '0.01';
+    interactiveSlider.value = '0.1';
+    interactiveSlider.style.width = '100%';
+    interactiveSlider.style.marginBottom = '15px';
+    interactiveSlider.addEventListener('input', (e) => {
+        const force = parseFloat(e.target.value);
+        particleCloud.setInteractivity(force);
+        interactiveLabel.textContent = `Mouse Influence: ${force.toFixed(2)}`;
+    });
+    panel.appendChild(interactiveSlider);
+    
+    // Mouse mode toggle (attract/repel)
+    const mouseModeContainer = document.createElement('div');
+    mouseModeContainer.style.display = 'flex';
+    mouseModeContainer.style.alignItems = 'center';
+    mouseModeContainer.style.justifyContent = 'space-between';
+    mouseModeContainer.style.marginBottom = '15px';
+    
+    const mouseModeLabel = document.createElement('span');
+    mouseModeLabel.textContent = 'Mouse Mode:';
+    mouseModeContainer.appendChild(mouseModeLabel);
+    
+    const mouseModeToggle = document.createElement('button');
+    mouseModeToggle.textContent = 'Attract';
+    mouseModeToggle.style.padding = '6px 12px';
+    mouseModeToggle.style.backgroundColor = '#4466ff';
+    mouseModeToggle.style.color = 'white';
+    mouseModeToggle.style.border = 'none';
+    mouseModeToggle.style.borderRadius = '6px';
+    mouseModeToggle.style.cursor = 'pointer';
+    
+    let isAttractMode = true;
+    mouseModeToggle.addEventListener('click', () => {
+        isAttractMode = !isAttractMode;
+        mouseModeToggle.textContent = isAttractMode ? 'Attract' : 'Repel';
+        mouseModeToggle.style.backgroundColor = isAttractMode ? '#4466ff' : '#ff4466';
+        particleCloud.setMouseMode(isAttractMode);
+    });
+    
+    mouseModeContainer.appendChild(mouseModeToggle);
+    panel.appendChild(mouseModeContainer);
+    
+    // Continuous mode option
+    const continuousModeContainer = document.createElement('div');
+    continuousModeContainer.style.display = 'flex';
+    continuousModeContainer.style.alignItems = 'center';
+    continuousModeContainer.style.justifyContent = 'space-between';
+    continuousModeContainer.style.marginBottom = '15px';
+    
+    const continuousModeLabel = document.createElement('span');
+    continuousModeLabel.textContent = 'Always Active:';
+    continuousModeContainer.appendChild(continuousModeLabel);
+    
+    const continuousModeCheckbox = document.createElement('input');
+    continuousModeCheckbox.type = 'checkbox';
+    continuousModeCheckbox.style.width = '18px';
+    continuousModeCheckbox.style.height = '18px';
+    continuousModeCheckbox.style.accentColor = '#4466ff';
+    
+    continuousModeCheckbox.addEventListener('change', () => {
+        isContinuousMode = continuousModeCheckbox.checked;
+    });
+    
+    continuousModeContainer.appendChild(continuousModeCheckbox);
+    panel.appendChild(continuousModeContainer);
+    
+    // Instructions
+    const instructions = document.createElement('div');
+    instructions.style.fontSize = '12px';
+    instructions.style.color = '#aac';
+    instructions.style.marginTop = '10px';
+    instructions.style.textAlign = 'center';
+    instructions.style.lineHeight = '1.5';
+    instructions.innerHTML = 'Click and drag to attract particles<br>Orbit: Left-click & drag<br>Zoom: Scroll wheel';
+    panel.appendChild(instructions);
+}
+
+// Create UI
+createUI();
+
+// Animation loop
+function animate() {
+    requestAnimationFrame(animate);
+    
+    const delta = Math.min(clock.getDelta(), 0.05); // Cap delta time to avoid jumps
+    
+    controls.update();
+    particleCloud.update(delta);
+    
+    // Update film grain time
+    filmGrainPass.uniforms.time.value += delta;
+    
+    // Render with post-processing
+    composer.render();
+}
+
+// Handle window resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+    bloomPass.resolution.set(window.innerWidth, window.innerHeight);
+});
+
+// Start animation
+animate(); 
